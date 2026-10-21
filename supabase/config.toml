@@ -1,0 +1,2 @@
+[functions.send-warranty-reminders]
+verify_jwt = false
