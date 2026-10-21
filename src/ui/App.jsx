@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 import {
+  addWarrantyDuration,
+  isValidWarranty,
+  itemFingerprint,
+  parseReceiptDate,
+} from "../lib/warranty.js";
+import {
   Activity,
   ArrowDownToLine,
   ArrowLeft,
@@ -36,6 +42,7 @@ import {
   Trash2,
   Upload,
   UserRound,
+  Users,
   X,
   Zap,
 } from "lucide-react";
@@ -128,20 +135,7 @@ const money = (n, currency = "INR") =>
     currency,
     maximumFractionDigits: currency === "INR" ? 0 : 2,
   }).format(Number(n) || 0);
-const datePlus = (date, value, unit) => {
-  const d = new Date(`${date}T12:00:00`);
-  if (unit === "days") d.setDate(d.getDate() + Number(value));
-  else {
-    const months = Number(value) * (unit === "years" ? 12 : 1),
-      day = d.getDate();
-    d.setDate(1);
-    d.setMonth(d.getMonth() + months);
-    d.setDate(
-      Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()),
-    );
-  }
-  return d.toISOString().slice(0, 10);
-};
+const datePlus = (date, value, unit) => addWarrantyDuration(date, value, unit);
 const uid = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 
 export default function App() {
@@ -163,6 +157,7 @@ export default function App() {
   const [authOpen, setAuthOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [claimItem, setClaimItem] = useState(null);
+  const [sharingItem, setSharingItem] = useState(null);
   const [mobileNav, setMobileNav] = useState(false);
   const [settings, setSettings] = useState(() => {
     try {
@@ -189,11 +184,11 @@ export default function App() {
     localStorage.setItem("wv-theme", dark ? "dark" : "light");
   }, [dark]);
   useEffect(() => {
-    localStorage.setItem("wv-items", JSON.stringify(items));
-  }, [items]);
+    if (!user) localStorage.setItem("wv-items", JSON.stringify(items));
+  }, [items, user]);
   useEffect(() => {
-    localStorage.setItem("wv-settings", JSON.stringify(settings));
-  }, [settings]);
+    if (!user) localStorage.setItem("wv-settings", JSON.stringify(settings));
+  }, [settings, user]);
   useEffect(() => {
     if (!supabase) return;
     supabase.auth
@@ -201,28 +196,79 @@ export default function App() {
       .then(({ data }) => setUser(data.session?.user || null));
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange((event, session) => {
       setUser(session?.user || null);
       if (session?.user) setAuthOpen(false);
+      else if (event === "SIGNED_OUT") {
+        try {
+          setItems(
+            JSON.parse(localStorage.getItem("wv-items") || "null") ||
+              starterItems,
+          );
+        } catch {
+          setItems(starterItems);
+        }
+        try {
+          setSettings((current) => ({
+            ...current,
+            ...JSON.parse(localStorage.getItem("wv-settings") || "{}"),
+          }));
+        } catch {}
+        setSelected(null);
+      }
     });
     return () => subscription.unsubscribe();
   }, []);
   useEffect(() => {
     if (!supabase || !user) return;
-    supabase
-      .from("items")
-      .select("*, receipts(file_url)")
-      .order("warranty_end")
-      .then(({ data, error }) => {
-        if (!error && data)
-          setItems(
-            data.map((i) => ({
-              ...i,
-              receipt_url: i.receipts?.[0]?.file_url || null,
-            })),
-          );
-      });
+    Promise.all([
+      supabase
+        .from("items")
+        .select("*, receipts(file_url, created_at)")
+        .order("warranty_end")
+        .order("created_at", { foreignTable: "receipts", ascending: false }),
+      supabase
+        .from("item_shares")
+        .select("item_id, permission, owner_id")
+        .eq("shared_with_user_id", user.id),
+    ]).then(([itemsResult, sharesResult]) => {
+      if (itemsResult.error || !itemsResult.data) {
+        setToast(
+          `Could not load your items: ${itemsResult.error?.message || "Please refresh and try again."}`,
+        );
+        return;
+      }
+      if (sharesResult.error)
+        setToast(
+          "Sharing is not set up yet. Your personal items are still available.",
+        );
+      const shares = new Map(
+        (sharesResult.data || []).map((share) => [share.item_id, share]),
+      );
+      setItems(
+        itemsResult.data.map((i) => {
+          const share = shares.get(i.id);
+          const isShared = i.user_id !== user.id;
+          return {
+            ...i,
+            is_shared: isShared,
+            share_permission: share?.permission || null,
+            receipt_url: i.receipts?.[0]?.file_url || null,
+          };
+        }),
+      );
+    });
   }, [user]);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const targetId = params.get("item");
+    if (!targetId) return;
+    const target = items.find((entry) => entry.id === targetId);
+    if (!target) return;
+    setSelected(target);
+    if (params.get("claim") === "1") setClaimItem(target);
+    window.history.replaceState({}, "", window.location.pathname);
+  }, [items]);
   useEffect(() => {
     if (!supabase || !user) return;
     supabase
@@ -230,7 +276,11 @@ export default function App() {
       .select("*")
       .eq("user_id", user.id)
       .maybeSingle()
-      .then(({ data }) => {
+      .then(({ data, error }) => {
+        if (error) {
+          setToast(`Could not load settings: ${error.message}`);
+          return;
+        }
         if (data)
           setSettings((s) => ({
             ...s,
@@ -315,94 +365,121 @@ export default function App() {
   const total = items.reduce((s, i) => s + Number(i.price || 0), 0);
   const activeCount = items.filter((i) => dayDiff(i.warranty_end) >= 0).length;
   const onSave = async (entry, file, existingId = null) => {
-    let receipt_url = entry.receipt_url || null;
-    const row = { ...entry, id: existingId || uid(), user_id: user?.id };
-    if (supabase && user) {
-      const payload = {
-        user_id: user.id,
-        name: entry.name,
-        brand: entry.brand,
-        store: entry.store,
-        price: Number(entry.price) || 0,
-        purchase_date: entry.purchase_date,
-        warranty_end: entry.warranty_end,
-        warranty_duration_months: entry.warranty_duration_months || null,
-        category: entry.category,
-        notes: entry.notes,
-        support_email: entry.support_email,
-        support_url: entry.support_url,
+    try {
+      let receipt_url = entry.receipt_url || null;
+      const ownerId = entry.user_id || user?.id;
+      const row = {
+        ...entry,
+        support_url: safeExternalUrl(entry.support_url),
+        id: existingId || uid(),
+        user_id: ownerId,
       };
-      const { data, error } = existingId
-        ? await supabase
-            .from("items")
-            .update(payload)
-            .eq("id", existingId)
-            .select()
-            .single()
-        : await supabase.from("items").insert(payload).select().single();
-      if (error) {
-        setToast(`Could not save: ${error.message}`);
-        return false;
-      }
-      row.id = data.id;
-      if (file) {
-        const path = `${user.id}/${data.id}/${Date.now()}-${file.name}`;
-        const up = await supabase.storage
-          .from("receipts")
-          .upload(path, file, { upsert: true });
-        if (!up.error) {
-          const { data: old } = await supabase
-            .from("receipts")
-            .select("file_url")
-            .eq("item_id", data.id);
-          if (old?.length) {
-            await supabase.storage
-              .from("receipts")
-              .remove(old.map((r) => r.file_url));
-            await supabase.from("receipts").delete().eq("item_id", data.id);
-          }
-          await supabase.from("receipts").insert({
-            user_id: user.id,
-            item_id: data.id,
-            file_url: path,
-            file_name: file.name,
-          });
-          receipt_url = path;
-        } else {
-          setToast(
-            `Item saved, but receipt upload failed: ${up.error.message}`,
-          );
+      if (supabase && user) {
+        const payload = {
+          user_id: ownerId,
+          name: entry.name,
+          brand: entry.brand,
+          store: entry.store,
+          price: Number(entry.price) || 0,
+          purchase_date: entry.purchase_date,
+          warranty_end: entry.warranty_end,
+          warranty_duration_months: entry.warranty_duration_months || null,
+          category: entry.category,
+          notes: entry.notes,
+          support_email: entry.support_email,
+          support_url: safeExternalUrl(entry.support_url),
+          warranty_source: entry.warranty_source || "user",
+          serial_number: entry.serial_number || null,
+          claim_issue: entry.claim_issue || null,
+        };
+        const { data, error } = existingId
+          ? await supabase
+              .from("items")
+              .update(payload)
+              .eq("id", existingId)
+              .select()
+              .single()
+          : await supabase.from("items").insert(payload).select().single();
+        if (error) {
+          setToast(`Could not save: ${error.message}`);
+          return false;
         }
-      }
-      if (existingId)
-        await supabase.from("reminders").delete().eq("item_id", data.id);
-      const today = daysFromNow(0),
-        due = [30, 7, 1]
-          .map((n) => ({
-            user_id: user.id,
-            item_id: data.id,
-            reminder_date: datePlus(entry.warranty_end, -n, "days"),
-            days_before: n,
-            status: "pending",
-          }))
-          .filter((r) => r.reminder_date >= today);
-      if (due.length) {
-        const { error: re } = await supabase.from("reminders").insert(due);
-        if (re)
-          setToast(`Item saved, but reminder setup failed: ${re.message}`);
-      }
-    } else if (file) receipt_url = await saveDemoReceipt(file);
-    row.receipt_url = receipt_url;
-    setItems((prev) =>
-      existingId
-        ? prev.map((i) => (i.id === existingId ? row : i))
-        : [...prev, row],
-    );
-    if (existingId) setSelected(row);
-    setAddOpen(false);
-    setEditing(null);
-    setToast(existingId ? "Item updated" : "Item added to your vault");
-    return true;
+        row.id = data.id;
+        if (file && (!existingId || ownerId === user.id)) {
+          const path = `${ownerId}/${data.id}/${Date.now()}-${safeFileName(file.name)}`;
+          const up = await supabase.storage
+            .from("receipts")
+            .upload(path, file, { upsert: true });
+          if (!up.error) {
+            const { data: old } = await supabase
+              .from("receipts")
+              .select("file_url")
+              .eq("item_id", data.id);
+            const { error: receiptError } = await supabase
+              .from("receipts")
+              .insert({
+                user_id: ownerId,
+                item_id: data.id,
+                file_url: path,
+                file_name: file.name,
+              });
+            if (receiptError) {
+              await supabase.storage.from("receipts").remove([path]);
+              setToast(
+                `Item saved, but receipt record failed: ${receiptError.message}`,
+              );
+            } else {
+              const oldPaths = (old || [])
+                .map((r) => r.file_url)
+                .filter((url) => url !== path);
+              if (oldPaths.length)
+                await supabase.storage.from("receipts").remove(oldPaths);
+              await supabase
+                .from("receipts")
+                .delete()
+                .eq("item_id", data.id)
+                .neq("file_url", path);
+              receipt_url = path;
+            }
+          } else {
+            setToast(
+              `Item saved, but receipt upload failed: ${up.error.message}`,
+            );
+          }
+        }
+        if (existingId && ownerId === user.id)
+          await supabase.from("reminders").delete().eq("item_id", data.id);
+        const today = daysFromNow(0),
+          due = [30, 7, 1]
+            .map((n) => ({
+              user_id: ownerId,
+              item_id: data.id,
+              reminder_date: datePlus(entry.warranty_end, -n, "days"),
+              days_before: n,
+              status: "pending",
+            }))
+            .filter((r) => r.reminder_date >= today);
+        if (due.length && ownerId === user.id) {
+          const { error: re } = await supabase.from("reminders").insert(due);
+          if (re)
+            setToast(`Item saved, but reminder setup failed: ${re.message}`);
+        }
+      } else if (file) receipt_url = await saveDemoReceipt(file);
+      row.receipt_url = receipt_url;
+      setItems((prev) =>
+        existingId
+          ? prev.map((i) => (i.id === existingId ? row : i))
+          : [...prev, row],
+      );
+      if (existingId) setSelected(row);
+      setAddOpen(false);
+      setEditing(null);
+      setToast(existingId ? "Item updated" : "Item added to your vault");
+      return true;
+    } catch (error) {
+      setToast(`Could not save item: ${error?.message || "Please try again."}`);
+      return false;
+    }
   };
   const removeItem = async (id) => {
     if (supabase && user) {
@@ -471,7 +548,51 @@ export default function App() {
         .then(
           ({ error }) =>
             error && setToast(`Settings not saved: ${error.message}`),
-        );
+        )
+        .catch((error) => setToast(`Settings not saved: ${error.message}`));
+  };
+  const shareItem = async ({ item, email, permission }) => {
+    if (!supabase || !user) {
+      setToast("Sign in with Supabase to share items securely");
+      return null;
+    }
+    try {
+      const { data, error } = await supabase.functions.invoke("share-item", {
+        body: { itemId: item.id, email, permission },
+      });
+      if (error || data?.error) {
+        setToast(error?.message || data.error);
+        return null;
+      }
+      setToast(
+        data.notificationSent
+          ? `Shared with ${data.email}`
+          : data.notificationConfigured
+            ? `Access granted to ${data.email}, but the invite email could not be sent.`
+            : `Shared with ${data.email}. Email delivery is not configured.`,
+      );
+      return data;
+    } catch (error) {
+      setToast(`Could not share item: ${error.message}`);
+      return null;
+    }
+  };
+  const revokeShare = async (shareId) => {
+    try {
+      const { error } = await supabase
+        .from("item_shares")
+        .delete()
+        .eq("id", shareId);
+      if (error) {
+        setToast(`Could not remove access: ${error.message}`);
+        return false;
+      }
+      setToast("Item access removed");
+      return true;
+    } catch (error) {
+      setToast(`Could not remove access: ${error.message}`);
+      return false;
+    }
   };
   const exportCsv = () =>
     download(
@@ -481,77 +602,208 @@ export default function App() {
       "warranty-vault.csv",
     );
   const exportPdf = async () => {
-    const [{ jsPDF }, { default: autoTable }] = await Promise.all([
-      import("jspdf"),
-      import("jspdf-autotable"),
-    ]);
-    const doc = new jsPDF({ orientation: "landscape" });
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(20);
-    doc.text("WarrantyVault inventory", 14, 18);
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(9);
-    doc.text(
-      `Exported ${dateFormat(daysFromNow(0))} · ${items.length} items`,
-      14,
-      25,
-    );
-    autoTable(doc, {
-      startY: 31,
-      head: [
-        [
-          "Item",
-          "Brand",
-          "Store",
-          "Price",
-          "Purchased",
-          "Warranty ends",
-          "Status",
+    try {
+      const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+        import("jspdf"),
+        import("jspdf-autotable"),
+      ]);
+      const doc = new jsPDF({ orientation: "landscape" });
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(20);
+      doc.text("WarrantyVault inventory", 14, 18);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.text(
+        `Exported ${dateFormat(daysFromNow(0))} · ${items.length} items`,
+        14,
+        25,
+      );
+      autoTable(doc, {
+        startY: 31,
+        head: [
+          [
+            "Item",
+            "Brand",
+            "Store",
+            "Price",
+            "Purchased",
+            "Warranty ends",
+            "Status",
+          ],
         ],
-      ],
-      body: sortedItems.map((i) => {
-        const d = dayDiff(i.warranty_end);
-        return [
-          i.name,
-          i.brand || "—",
-          i.store || "—",
-          money(i.price, settings.currency),
-          dateFormat(i.purchase_date),
-          dateFormat(i.warranty_end),
-          d < 0 ? "Expired" : d <= 30 ? "Expiring soon" : "Active",
-        ];
-      }),
-      styles: { fontSize: 8, cellPadding: 3 },
-      headStyles: { fillColor: [48, 104, 72] },
-    });
-    doc.save("warranty-vault.pdf");
+        body: sortedItems.map((i) => {
+          const d = dayDiff(i.warranty_end);
+          return [
+            i.name,
+            i.brand || "—",
+            i.store || "—",
+            money(i.price, settings.currency),
+            dateFormat(i.purchase_date),
+            dateFormat(i.warranty_end),
+            d < 0 ? "Expired" : d <= 30 ? "Expiring soon" : "Active",
+          ];
+        }),
+        styles: { fontSize: 8, cellPadding: 3 },
+        headStyles: { fillColor: [48, 104, 72] },
+      });
+      doc.save("warranty-vault.pdf");
+    } catch (error) {
+      setToast(`PDF export failed: ${error.message}`);
+    }
   };
   const exportBundle = async () => {
     try {
       const { default: JSZip } = await import("jszip");
       const zip = new JSZip();
       zip.file("warranty-data.csv", itemsToCsv(items, settings.currency));
-      const folder = zip.folder("receipts");
-      let added = 0;
+      const manifestItems = [];
+      let added = 0,
+        failed = 0;
       for (const item of items) {
-        if (!item.receipt_url) continue;
-        try {
-          folder.file(
-            `${safeName(item.name)}-${safeName(item.brand || "receipt")}.${extensionFor(item.receipt_url)}`,
-            await getReceiptBlob(item.receipt_url),
-          );
-          added++;
-        } catch {}
+        const clean = { ...item };
+        delete clean.receipts;
+        delete clean.receipt_url;
+        delete clean.user_id;
+        delete clean.is_shared;
+        delete clean.share_permission;
+        if (item.receipt_url) {
+          const receiptPath = `receipts/${safeName(item.id)}.${extensionFor(item.receipt_url)}`;
+          try {
+            const receiptBlob = await getReceiptBlob(item.receipt_url);
+            zip.file(receiptPath, receiptBlob);
+            clean.backup_receipt_path = receiptPath;
+            clean.backup_receipt_type =
+              receiptBlob.type || "application/octet-stream";
+            added++;
+          } catch {
+            failed++;
+          }
+        }
+        manifestItems.push(clean);
       }
+      zip.file(
+        "manifest.json",
+        JSON.stringify(
+          {
+            format: "warrantyvault-backup",
+            version: 1,
+            exported_at: new Date().toISOString(),
+            settings,
+            items: manifestItems,
+          },
+          null,
+          2,
+        ),
+      );
       download(
         await zip.generateAsync({ type: "blob" }),
         "warranty-vault-backup.zip",
       );
       setToast(
-        `Backup downloaded${added ? ` with ${added} receipt${added === 1 ? "" : "s"}` : ""}`,
+        `Backup downloaded with ${items.length} items, ${added} receipts${failed ? `; ${failed} receipt(s) could not be included` : ""}`,
       );
     } catch (e) {
       setToast(`Export failed: ${e.message}`);
+    }
+  };
+  const importBundle = async (file) => {
+    if (!file) return;
+    if (file.size > 100 * 1024 * 1024) {
+      setToast("Backup archive must be 100 MB or smaller");
+      return;
+    }
+    try {
+      const { default: JSZip } = await import("jszip");
+      const archive = await JSZip.loadAsync(file, { checkCRC32: true });
+      const manifestFile = archive.file("manifest.json");
+      if (!manifestFile)
+        throw new Error("This archive is not a WarrantyVault backup");
+      const manifest = JSON.parse(await manifestFile.async("string"));
+      if (
+        manifest.format !== "warrantyvault-backup" ||
+        manifest.version !== 1 ||
+        !Array.isArray(manifest.items) ||
+        manifest.items.length > 500
+      )
+        throw new Error("Unsupported, invalid, or too large backup format");
+      let restored = 0,
+        skipped = 0,
+        receiptsOmitted = 0;
+      const fingerprints = new Set(items.map(itemFingerprint));
+      for (const source of manifest.items) {
+        const fingerprint = itemFingerprint(source);
+        if (!isValidWarranty(source) || fingerprints.has(fingerprint)) {
+          skipped++;
+          continue;
+        }
+        let receipt = null;
+        if (source.backup_receipt_path) {
+          const archived = archive.file(source.backup_receipt_path);
+          if (archived) {
+            const blob = await archived.async("blob");
+            const receiptType = source.backup_receipt_type || blob.type;
+            if (
+              blob.size > 10 * 1024 * 1024 ||
+              ![
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+                "application/pdf",
+              ].includes(receiptType)
+            )
+              receiptsOmitted++;
+            else
+              receipt = new File(
+                [blob],
+                `${safeFileName(source.name)}.${extensionFor(source.backup_receipt_path, receiptType)}`,
+                { type: receiptType },
+              );
+          }
+        }
+        const entry = {
+          ...source,
+          category: Object.hasOwn(icons, source.category)
+            ? source.category
+            : "Other",
+          warranty_source: ["receipt", "manufacturer", "user"].includes(
+            source.warranty_source,
+          )
+            ? source.warranty_source
+            : "user",
+          id: undefined,
+          user_id: user?.id,
+          is_shared: false,
+          share_permission: null,
+        };
+        delete entry.backup_receipt_path;
+        delete entry.backup_receipt_type;
+        delete entry.receipt_url;
+        const ok = await onSave(entry, receipt);
+        if (ok) {
+          restored++;
+          fingerprints.add(fingerprint);
+        } else skipped++;
+      }
+      if (manifest.settings && typeof manifest.settings === "object") {
+        const allowedCurrencies = ["INR", "USD", "EUR", "GBP"];
+        const restoredSettings = {
+          alerts: Boolean(manifest.settings.alerts),
+          emailAlerts: Boolean(manifest.settings.emailAlerts),
+          email:
+            typeof manifest.settings.email === "string"
+              ? manifest.settings.email.slice(0, 254)
+              : "",
+          currency: allowedCurrencies.includes(manifest.settings.currency)
+            ? manifest.settings.currency
+            : "INR",
+        };
+        saveSettings(restoredSettings);
+      }
+      setToast(
+        `Backup restored: ${restored} added, ${skipped} duplicate or invalid items skipped${receiptsOmitted ? `; ${receiptsOmitted} unsupported receipt(s) omitted` : ""}`,
+      );
+    } catch (e) {
+      setToast(`Restore failed: ${e.message}`);
     }
   };
   const navTo = (x) => {
@@ -708,6 +960,8 @@ export default function App() {
               exportCsv={exportCsv}
               exportPdf={exportPdf}
               exportBundle={exportBundle}
+              importBundle={importBundle}
+              synced={!!(supabase && user)}
             />
           ) : selected ? (
             <DetailPage
@@ -716,6 +970,16 @@ export default function App() {
               onBack={() => setSelected(null)}
               onEdit={() => openAdd(selected)}
               onClaim={() => setClaimItem(selected)}
+              onShare={() => setSharingItem(selected)}
+              canEdit={
+                !selected.is_shared || selected.share_permission === "editor"
+              }
+              canDelete={
+                !selected.is_shared && (!user || selected.user_id === user.id)
+              }
+              isOwner={
+                !!user && !selected.is_shared && selected.user_id === user.id
+              }
               onDelete={() => removeItem(selected.id)}
               toast={setToast}
             />
@@ -985,6 +1249,7 @@ export default function App() {
       {addOpen && (
         <AddModal
           item={editing}
+          canUploadReceipt={!editing?.is_shared}
           currency={settings.currency}
           onClose={() => {
             setAddOpen(false);
@@ -1000,6 +1265,16 @@ export default function App() {
           onClose={() => setAuthOpen(false)}
           onEmail={(email) => signIn("email", email)}
           onGoogle={() => signIn("google")}
+        />
+      )}
+      {sharingItem && (
+        <ShareModal
+          item={sharingItem}
+          user={user}
+          onShare={shareItem}
+          onRevoke={revokeShare}
+          onClose={() => setSharingItem(null)}
+          toast={setToast}
         />
       )}
       {claimItem && (
@@ -1091,7 +1366,14 @@ function ItemRow({ item, currency, open, onClaim }) {
     </article>
   );
 }
-function AddModal({ item, currency, onClose, onSave, toast }) {
+function AddModal({
+  item,
+  canUploadReceipt = true,
+  currency,
+  onClose,
+  onSave,
+  toast,
+}) {
   const [form, setForm] = useState(() =>
     item
       ? { ...item, price: item.price || "" }
@@ -1102,6 +1384,9 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
           price: "",
           purchase_date: daysFromNow(0),
           warranty_end: datePlus(daysFromNow(0), 12, "months"),
+          warranty_source: "user",
+          serial_number: "",
+          claim_issue: "",
           category: "Electronics",
           notes: "",
           support_email: "",
@@ -1115,15 +1400,36 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
     item?.warranty_duration_months || 12,
   );
   const [durationUnit, setDurationUnit] = useState("months");
+  const [advanced, setAdvanced] = useState(!!item);
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState("");
+  const [ocrText, setOcrText] = useState("");
   const [busy, setBusy] = useState(false);
   const [ocr, setOcr] = useState(false);
   const input = useRef(null);
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  useEffect(
+    () => () => {
+      if (preview) URL.revokeObjectURL(preview);
+    },
+    [preview],
+  );
   const handleFile = async (f) => {
     if (!f) return;
+    if (f.size > 10 * 1024 * 1024) {
+      toast("Receipt must be 10 MB or smaller");
+      return;
+    }
+    if (
+      !["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(
+        f.type,
+      )
+    ) {
+      toast("Choose a JPG, PNG, WebP, or PDF receipt");
+      return;
+    }
     setFile(f);
+    setOcrText("");
     if (f.type.startsWith("image/")) setPreview(URL.createObjectURL(f));
     else setPreview("");
     if (!f.type.startsWith("image/")) return;
@@ -1133,6 +1439,7 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
       const T = await import("tesseract.js");
       const { data } = await T.recognize(f, "eng");
       const text = data.text || "";
+      setOcrText(text);
       const lines = text
         .split("\n")
         .map((x) => x.trim())
@@ -1143,8 +1450,9 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
           !/receipt|invoice|total|tax|change|cash|visa|mastercard/i.test(x),
       );
       const priceMatch =
-        text.match(/(?:total|amount)[^\d]{0,12}\$?\s?(\d{1,5}\.\d{2})/i) ||
-        text.match(/\$\s?(\d{1,5}\.\d{2})/);
+        text.match(
+          /(?:grand\s+)?(?:total|amount)[^\d]{0,15}(?:₹|rs\.?|inr|\$)?\s?([\d,]+(?:\.\d{1,2})?)/i,
+        ) || text.match(/(?:₹|rs\.?|inr|\$)\s?([\d,]+(?:\.\d{1,2})?)/i);
       const dateMatch = text.match(
         /\b(\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4}))\b/,
       );
@@ -1152,7 +1460,7 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
         ...fm,
         name: fm.name || candidates[1] || candidates[0] || "",
         store: fm.store || candidates[0] || "",
-        price: fm.price || priceMatch?.[1] || "",
+        price: fm.price || priceMatch?.[1]?.replaceAll(",", "") || "",
         purchase_date:
           fm.purchase_date === daysFromNow(0)
             ? dateMatch
@@ -1169,6 +1477,15 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
   };
   const submit = async (e) => {
     e.preventDefault();
+    if (
+      durationMode &&
+      (!Number.isFinite(Number(duration)) ||
+        Number(duration) < 1 ||
+        Number(duration) > 120)
+    ) {
+      toast("Warranty length must be between 1 and 120 months or years");
+      return;
+    }
     const warranty_end = durationMode
       ? datePlus(
           form.purchase_date,
@@ -1176,12 +1493,7 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
           "months",
         )
       : form.warranty_end;
-    if (
-      !form.name ||
-      !form.purchase_date ||
-      !warranty_end ||
-      warranty_end < form.purchase_date
-    ) {
+    if (!isValidWarranty({ ...form, warranty_end })) {
       toast("Add a valid item name, purchase date, and warranty expiry");
       return;
     }
@@ -1218,56 +1530,118 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
           </button>
         </header>
         <form onSubmit={submit}>
-          <div
-            className="upload-zone"
-            onClick={() => input.current?.click()}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              handleFile(e.dataTransfer.files[0]);
-            }}
-          >
-            {preview ? (
-              <img src={preview} className="receipt-preview" />
-            ) : (
-              <div className="upload-icon">
-                <CloudUpload size={22} />
-              </div>
-            )}
-            <div className="upload-copy">
-              <b>{file ? file.name : "Upload a receipt"}</b>
-              <span>
-                {ocr
-                  ? "Reading receipt with OCR…"
-                  : "Drop a file here, or browse · JPG, PNG, PDF"}
-              </span>
-            </div>
-            <button
-              type="button"
-              className="browse-button"
-              onClick={(e) => {
-                e.stopPropagation();
-                input.current?.click();
+          {canUploadReceipt && (
+            <div
+              className="upload-zone"
+              onClick={() => input.current?.click()}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleFile(e.dataTransfer.files[0]);
               }}
             >
-              {ocr ? (
-                "Scanning…"
+              {preview ? (
+                <img
+                  src={preview}
+                  className="receipt-preview"
+                  alt="Receipt image preview"
+                />
               ) : (
-                <>
-                  <Upload size={14} />
-                  Browse
-                </>
+                <div className="upload-icon">
+                  <CloudUpload size={22} />
+                </div>
               )}
+              <div className="upload-copy">
+                <b>{file ? file.name : "Upload a receipt"}</b>
+                <span>
+                  {ocr
+                    ? "Reading receipt with OCR…"
+                    : "Drop a file here, or browse · JPG, PNG, PDF"}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="browse-button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  input.current?.click();
+                }}
+              >
+                {ocr ? (
+                  "Scanning…"
+                ) : (
+                  <>
+                    <Upload size={14} />
+                    Browse
+                  </>
+                )}
+              </button>
+              <input
+                ref={input}
+                type="file"
+                accept="image/*,.pdf"
+                capture="environment"
+                hidden
+                onChange={(e) => handleFile(e.target.files?.[0])}
+              />
+            </div>
+          )}
+          {!canUploadReceipt && (
+            <p className="integration-note">
+              You can edit shared item details, but only the owner can replace
+              its receipt.
+            </p>
+          )}
+          {file && (
+            <div className="receipt-review-grid">
+              <div className="receipt-review-image">
+                {preview ? (
+                  <img src={preview} alt="Uploaded receipt" />
+                ) : (
+                  <FileText size={28} />
+                )}
+                <span>{file.name}</span>
+              </div>
+              <div className="receipt-review-copy">
+                <b>{ocrText ? "Review OCR results" : "Receipt added"}</b>
+                <p>
+                  {ocrText
+                    ? "Check the extracted details, then edit any field below before saving."
+                    : "PDF receipts are saved but are not OCR-scanned in this version."}
+                </p>
+                <dl>
+                  <div>
+                    <dt>Product</dt>
+                    <dd>{form.name || "Not detected"}</dd>
+                  </div>
+                  <div>
+                    <dt>Store</dt>
+                    <dd>{form.store || "Not detected"}</dd>
+                  </div>
+                  <div>
+                    <dt>Purchased</dt>
+                    <dd>{form.purchase_date || "Not detected"}</dd>
+                  </div>
+                  <div>
+                    <dt>Price</dt>
+                    <dd>{form.price || "Not detected"}</dd>
+                  </div>
+                </dl>
+              </div>
+            </div>
+          )}
+          {!item && (
+            <button
+              type="button"
+              className="text-button quick-details-toggle"
+              onClick={() => setAdvanced(!advanced)}
+            >
+              {advanced
+                ? "Hide optional details"
+                : "Add price, brand, store, category, and claim details"}
+              <ChevronDown size={14} />
             </button>
-            <input
-              ref={input}
-              type="file"
-              accept="image/*,.pdf"
-              capture="environment"
-              hidden
-              onChange={(e) => handleFile(e.target.files?.[0])}
-            />
-          </div>
+          )}
           <div className="form-grid">
             <label className="field full">
               Product name <em>*</em>
@@ -1278,22 +1652,26 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
                 required
               />
             </label>
-            <label className="field">
-              Brand
-              <input
-                value={form.brand}
-                onChange={(e) => set("brand", e.target.value)}
-                placeholder="e.g. Apple"
-              />
-            </label>
-            <label className="field">
-              Store
-              <input
-                value={form.store}
-                onChange={(e) => set("store", e.target.value)}
-                placeholder="Where did you buy it?"
-              />
-            </label>
+            {advanced && (
+              <>
+                <label className="field">
+                  Brand
+                  <input
+                    value={form.brand}
+                    onChange={(e) => set("brand", e.target.value)}
+                    placeholder="e.g. Apple"
+                  />
+                </label>
+                <label className="field">
+                  Store
+                  <input
+                    value={form.store}
+                    onChange={(e) => set("store", e.target.value)}
+                    placeholder="Where did you buy it?"
+                  />
+                </label>
+              </>
+            )}
             <label className="field">
               Purchase date
               <input
@@ -1302,28 +1680,32 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
                 onChange={(e) => set("purchase_date", e.target.value)}
               />
             </label>
-            <label className="field">
-              Price
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                value={form.price}
-                onChange={(e) => set("price", e.target.value)}
-                placeholder="$0.00"
-              />
-            </label>
-            <label className="field">
-              Category
-              <select
-                value={form.category}
-                onChange={(e) => set("category", e.target.value)}
-              >
-                {Object.keys(icons).map((x) => (
-                  <option key={x}>{x}</option>
-                ))}
-              </select>
-            </label>
+            {advanced && (
+              <>
+                <label className="field">
+                  Price
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={form.price}
+                    onChange={(e) => set("price", e.target.value)}
+                    placeholder="$0.00"
+                  />
+                </label>
+                <label className="field">
+                  Category
+                  <select
+                    value={form.category}
+                    onChange={(e) => set("category", e.target.value)}
+                  >
+                    {Object.keys(icons).map((x) => (
+                      <option key={x}>{x}</option>
+                    ))}
+                  </select>
+                </label>
+              </>
+            )}
             <label className="field full">
               Warranty coverage <em>*</em>
               <div className="coverage-mode">
@@ -1382,32 +1764,70 @@ function AddModal({ item, currency, onClose, onSave, toast }) {
               )}
             </label>
             <label className="field full">
-              Support email <span className="optional">for claim helper</span>
-              <input
-                type="email"
-                value={form.support_email}
-                onChange={(e) => set("support_email", e.target.value)}
-                placeholder="support@brand.com"
-              />
+              Warranty source
+              <select
+                value={form.warranty_source || "user"}
+                onChange={(e) => set("warranty_source", e.target.value)}
+              >
+                <option value="receipt">Printed on receipt</option>
+                <option value="manufacturer">
+                  Confirmed with manufacturer
+                </option>
+                <option value="user">Entered by me / unsure</option>
+              </select>
+              <small className="expiry-preview">
+                This records how the coverage period was confirmed.
+              </small>
             </label>
-            <label className="field full">
-              Support website <span className="optional">for claim helper</span>
-              <input
-                type="url"
-                value={form.support_url || ""}
-                onChange={(e) => set("support_url", e.target.value)}
-                placeholder="https://support.brand.com"
-              />
-            </label>
-            <label className="field full">
-              Notes
-              <textarea
-                value={form.notes}
-                onChange={(e) => set("notes", e.target.value)}
-                placeholder="Serial number, color, or anything useful…"
-                rows="2"
-              />
-            </label>
+            {advanced && (
+              <>
+                <label className="field">
+                  Serial number
+                  <input
+                    value={form.serial_number || ""}
+                    onChange={(e) => set("serial_number", e.target.value)}
+                    placeholder="Optional product serial number"
+                  />
+                </label>
+                <label className="field">
+                  Claim issue
+                  <input
+                    value={form.claim_issue || ""}
+                    onChange={(e) => set("claim_issue", e.target.value)}
+                    placeholder="What issue are you reporting?"
+                  />
+                </label>
+                <label className="field full">
+                  Support email{" "}
+                  <span className="optional">for claim helper</span>
+                  <input
+                    type="email"
+                    value={form.support_email}
+                    onChange={(e) => set("support_email", e.target.value)}
+                    placeholder="support@brand.com"
+                  />
+                </label>
+                <label className="field full">
+                  Support website{" "}
+                  <span className="optional">for claim helper</span>
+                  <input
+                    type="url"
+                    value={form.support_url || ""}
+                    onChange={(e) => set("support_url", e.target.value)}
+                    placeholder="https://support.brand.com"
+                  />
+                </label>
+                <label className="field full">
+                  Notes
+                  <textarea
+                    value={form.notes}
+                    onChange={(e) => set("notes", e.target.value)}
+                    placeholder="Serial number, color, or anything useful…"
+                    rows="2"
+                  />
+                </label>
+              </>
+            )}
           </div>
           <div className="modal-footer">
             <span className="secure-note">
@@ -1445,6 +1865,10 @@ function DetailPage({
   onClaim,
   onDelete,
   onEdit,
+  onShare,
+  canEdit,
+  canDelete,
+  isOwner,
   toast,
 }) {
   const d = dayDiff(item.warranty_end);
@@ -1465,9 +1889,16 @@ function DetailPage({
           </p>
         </div>
         <div className="detail-actions">
-          <button className="secondary-button" onClick={onEdit}>
-            <Pencil size={15} /> Edit item
-          </button>
+          {isOwner && (
+            <button className="secondary-button" onClick={onShare}>
+              <Users size={15} /> Share
+            </button>
+          )}
+          {canEdit && (
+            <button className="secondary-button" onClick={onEdit}>
+              <Pencil size={15} /> Edit item
+            </button>
+          )}
           <button className="primary-button" onClick={onClaim}>
             <Headphones size={16} /> Prepare a claim
           </button>
@@ -1533,16 +1964,43 @@ function DetailPage({
               />
               <Info label="Store" value={item.store || "—"} />
               <Info label="Category" value={item.category || "Other"} />
+              <Info
+                label="Warranty source"
+                value={
+                  {
+                    receipt: "Printed on receipt",
+                    manufacturer: "Manufacturer confirmed",
+                    user: "Entered by me / unsure",
+                  }[item.warranty_source] || "Entered by me / unsure"
+                }
+              />
+              {item.serial_number && (
+                <Info label="Serial number" value={item.serial_number} />
+              )}
             </div>
-            {item.support_url && (
+            {safeExternalUrl(item.support_url) && (
               <a
                 className="support-link"
-                href={item.support_url}
+                href={safeExternalUrl(item.support_url)}
                 target="_blank"
                 rel="noreferrer"
               >
                 Visit {item.brand || "brand"} support <ArrowRight size={14} />
               </a>
+            )}
+            {item.claim_issue && (
+              <div className="notes-box">
+                <span>CLAIM ISSUE</span>
+                <p>{item.claim_issue}</p>
+              </div>
+            )}
+            {item.is_shared && (
+              <p className="shared-readonly-note">
+                Shared with you ·{" "}
+                {item.share_permission === "editor"
+                  ? "you can edit details"
+                  : "view only"}
+              </p>
             )}
             {item.notes && (
               <div className="notes-box">
@@ -1607,15 +2065,16 @@ function DetailPage({
               Open claim helper <ArrowRight size={15} />
             </button>
           </div>
-          <button
-            className="delete-button"
-            onClick={() => {
-              if (confirm(`Remove ${item.name} from your vault?`)) onDelete();
-            }}
-          >
-            <Trash2 size={15} />
-            Remove this item
-          </button>
+          {canDelete && (
+            <button
+              className="delete-button"
+              onClick={() => {
+                if (confirm(`Remove ${item.name} from your vault?`)) onDelete();
+              }}
+            >
+              <Trash2 size={15} /> Remove this item
+            </button>
+          )}
         </aside>
       </div>
     </div>
@@ -1629,33 +2088,160 @@ function Info({ label, value }) {
     </div>
   );
 }
+function ShareModal({ item, user, onShare, onRevoke, onClose, toast }) {
+  const [email, setEmail] = useState("");
+  const [permission, setPermission] = useState("viewer");
+  const [shares, setShares] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const refresh = async () => {
+    if (!supabase || !user) return;
+    const { data, error } = await supabase
+      .from("item_shares")
+      .select("id,shared_email,permission")
+      .eq("item_id", item.id)
+      .eq("owner_id", user.id);
+    if (error) toast(`Could not load sharing access: ${error.message}`);
+    else setShares(data || []);
+  };
+  useEffect(() => {
+    refresh();
+  }, [item.id, user?.id]);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    const result = await onShare({ item, email, permission });
+    setBusy(false);
+    if (result) {
+      setEmail("");
+      await refresh();
+    }
+  };
+  return (
+    <div
+      className="overlay"
+      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <section className="modal share-modal">
+        <header className="modal-header">
+          <div>
+            <span className="eyebrow mini-eyebrow">HOUSEHOLD SHARING</span>
+            <h2>Share {item.name}</h2>
+            <p>
+              Only invited WarrantyVault accounts can access this item and its
+              receipt.
+            </p>
+          </div>
+          <button className="icon-button" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </header>
+        <form onSubmit={submit} className="share-form">
+          <label className="field">
+            Account email
+            <input
+              type="email"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="family@example.com"
+            />
+          </label>
+          <label className="field">
+            Access level
+            <select
+              value={permission}
+              onChange={(e) => setPermission(e.target.value)}
+            >
+              <option value="viewer">Can view</option>
+              <option value="editor">Can edit item details</option>
+            </select>
+          </label>
+          <button className="primary-button" disabled={busy || !email}>
+            {busy ? "Sharing…" : "Share item"}
+          </button>
+        </form>
+        <p className="integration-note">
+          The other person must already have a WarrantyVault account. Email
+          invitations require APP_URL and Resend secrets; access is still
+          granted securely if email is not configured.
+        </p>
+        <div className="shared-list">
+          <b>People with access</b>
+          {shares.length ? (
+            shares.map((share) => (
+              <div className="shared-person" key={share.id}>
+                <span className="avatar">
+                  {share.shared_email?.[0]?.toUpperCase() || "?"}
+                </span>
+                <span>
+                  <strong>{share.shared_email}</strong>
+                  <small>
+                    {share.permission === "editor"
+                      ? "Can edit details"
+                      : "Can view"}
+                  </small>
+                </span>
+                <button
+                  className="text-button"
+                  onClick={async () => {
+                    if (await onRevoke(share.id))
+                      setShares((old) => old.filter((s) => s.id !== share.id));
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            ))
+          ) : (
+            <span className="integration-note">
+              No one else has access yet.
+            </span>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
 function ClaimModal({ item, onClose, toast }) {
   const [support, setSupport] = useState(item.support_email || "");
   const subject = `Warranty claim: ${item.name}`;
-  const body = `Hello ${item.brand || "Support Team"},\n\nI would like to request warranty service for my ${item.name}.\n\nProduct: ${item.name}${item.brand ? ` (${item.brand})` : ""}\nPurchased from: ${item.store || "—"}\nPurchase date: ${dateFormat(item.purchase_date)}\nWarranty expiry: ${dateFormat(item.warranty_end)}\n${item.notes ? `\nAdditional details: ${item.notes}\n` : ""}\nI have attached my proof of purchase. Please let me know the next steps.\n\nThank you.`;
+  const [issue, setIssue] = useState(item.claim_issue || "");
+  const body = `Hello ${item.brand || "Support Team"},\n\nI would like to request warranty service for my ${item.name}.\n\nProduct: ${item.name}${item.brand ? ` (${item.brand})` : ""}\nSerial number: ${item.serial_number || "Not provided"}\nPurchased from: ${item.store || "—"}\nPurchase date: ${dateFormat(item.purchase_date)}\nWarranty expiry: ${dateFormat(item.warranty_end)}\n${issue ? `\nIssue: ${issue}\n` : ""}${item.notes ? `\nAdditional details: ${item.notes}\n` : ""}\nI can provide my proof of purchase. Please let me know the next steps.\n\nThank you.`;
+  const validSupportEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(support.trim());
+  const cleanSubject = subject.replace(/[\r\n]+/g, " ").trim();
   const copy = async () => {
-    await navigator.clipboard.writeText(
-      `To: ${support}\nSubject: ${subject}\n\n${body}`,
-    );
-    toast("Claim message copied");
+    try {
+      await navigator.clipboard.writeText(
+        `To: ${support.trim()}\nSubject: ${cleanSubject}\n\n${body}`,
+      );
+      toast("Claim message copied");
+    } catch {
+      toast(
+        "Could not access the clipboard. Select and copy the preview instead.",
+      );
+    }
   };
   const send = () => {
-    if (!support) {
-      toast("Add a support email first");
+    if (!validSupportEmail) {
+      toast("Enter a valid brand support email first");
       return;
     }
-    window.location.href = `mailto:${encodeURIComponent(support)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    window.location.href = `mailto:${encodeURIComponent(support.trim())}?subject=${encodeURIComponent(cleanSubject)}&body=${encodeURIComponent(body)}`;
     toast("Email draft opened — attach your receipt before sending");
   };
   const downloadEmail = async () => {
+    if (!validSupportEmail) {
+      toast("Enter a valid brand support email first");
+      return;
+    }
     try {
       const blob = item.receipt_url
         ? await getReceiptBlob(item.receipt_url)
         : null;
       const boundary = `wv-${uid()}`;
       const headers = [
-        `To: ${support}`,
-        `Subject: ${subject}`,
+        `To: ${support.trim().replace(/[\r\n]+/g, "")}`,
+        `Subject: ${cleanSubject}`,
         "MIME-Version: 1.0",
         `Content-Type: multipart/mixed; boundary="${boundary}"`,
         "",
@@ -1670,7 +2256,9 @@ function ClaimModal({ item, onClose, toast }) {
         let binary = "";
         bytes.forEach((b) => (binary += String.fromCharCode(b)));
         const encoded = btoa(binary);
-        const filename = blob.name || "receipt";
+        const filename = safeFileName(
+          blob.name || `receipt.${extensionFor(item.receipt_url, blob.type)}`,
+        );
         headers.push(
           `--${boundary}`,
           `Content-Type: ${blob.type || "application/octet-stream"}; name="${filename}"`,
@@ -1719,6 +2307,39 @@ function ClaimModal({ item, onClose, toast }) {
             placeholder="Enter the brand’s support address"
           />
         </label>
+        {safeExternalUrl(item.support_url) && (
+          <a
+            className="support-link claim-support-link"
+            href={safeExternalUrl(item.support_url)}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Open {item.brand || "brand"} support website{" "}
+            <ArrowRight size={14} />
+          </a>
+        )}
+        <div className="claim-checklist">
+          <b>Claim checklist</b>
+          <span>
+            <Check size={14} /> Product and purchase details{" "}
+            {item.serial_number ? "with serial number" : ""}
+          </span>
+          <span>
+            {item.receipt_url ? <Check size={14} /> : <CircleHelp size={14} />}{" "}
+            {item.receipt_url
+              ? "Receipt ready to attach or include in .eml"
+              : "Add a receipt if the manufacturer requires proof"}
+          </span>
+          <label className="field">
+            Describe the issue
+            <textarea
+              rows="3"
+              value={issue}
+              onChange={(e) => setIssue(e.target.value)}
+              placeholder="When did it start? What have you tried?"
+            />
+          </label>
+        </div>
         <div className="claim-preview">
           <div className="claim-preview-head">
             <span>EMAIL PREVIEW</span>
@@ -1829,6 +2450,8 @@ function SettingsPage({
   exportCsv,
   exportPdf,
   exportBundle,
+  importBundle,
+  synced,
 }) {
   return (
     <div className="settings-page">
@@ -1987,9 +2610,25 @@ function SettingsPage({
                 PDF
               </button>
               <button className="secondary-button" onClick={exportBundle}>
-                ZIP + receipts
+                ZIP backup
               </button>
+              <label className="secondary-button import-backup-button">
+                Restore backup
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  hidden
+                  onChange={(e) => {
+                    importBundle(e.target.files?.[0]);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
             </div>
+            <p className="integration-note">
+              Restore merges items into this vault. Existing items are kept;
+              matching item names and purchase dates are skipped.
+            </p>
           </div>
           <div className="settings-card">
             <div className="settings-card-title">
@@ -2022,17 +2661,29 @@ function SettingsPage({
         <aside className="settings-aside">
           <div className="settings-card privacy-panel">
             <span className="eyebrow mini-eyebrow">YOUR DATA</span>
-            <h3>Your receipts stay private.</h3>
+            <h3>
+              {synced
+                ? "Vault synced to your account"
+                : "Saved in this browser"}
+            </h3>
             <p>
-              Receipt images stay on this device in demo mode, or in your
-              private Supabase storage when connected.
+              {synced
+                ? "Your items and receipts sync through your private account storage."
+                : "Demo items live only in this browser. Use ZIP backup to move them or restore them later."}
             </p>
+            <span className={`sync-status ${synced ? "connected" : "local"}`}>
+              <i />
+              {synced ? "Account sync on" : "Local only · not backed up online"}
+            </span>
           </div>
           <div className="privacy-note">
             <ShieldCheck size={17} />
             <div>
               <b>Your information is yours.</b>
-              <span>Receipts and item details are only visible to you.</span>
+              <span>
+                Receipts and details stay private. Shared items are visible only
+                to invited accounts.
+              </span>
             </div>
           </div>
         </aside>
@@ -2067,9 +2718,35 @@ function safeName(value) {
       .slice(0, 64) || "receipt"
   );
 }
-function extensionFor(url) {
-  const match = String(url).match(/\.([a-z0-9]{2,5})(?:$|\?)/i);
-  return match?.[1]?.toLowerCase() || "pdf";
+function extensionFor(url, mimeType = "") {
+  const match = String(url).match(/\.([a-z0-9]{2,5})(?:$|[?&#])/i);
+  if (match) return match[1].toLowerCase();
+  return (
+    {
+      "image/jpeg": "jpg",
+      "image/png": "png",
+      "image/webp": "webp",
+      "application/pdf": "pdf",
+    }[mimeType] || "bin"
+  );
+}
+function safeFileName(value) {
+  return (
+    String(value || "receipt")
+      .split(/[\\/]/)
+      .pop()
+      .replace(/[\r\n\"]+/g, "")
+      .replace(/[^a-z0-9._-]+/gi, "-")
+      .slice(0, 120) || "receipt"
+  );
+}
+function safeExternalUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch {
+    return "";
+  }
 }
 function itemsToCsv(items, currency = "INR") {
   const cols = [
@@ -2081,6 +2758,9 @@ function itemsToCsv(items, currency = "INR") {
     "purchase_date",
     "warranty_end",
     "warranty_duration_months",
+    "warranty_source",
+    "serial_number",
+    "claim_issue",
     "category",
     "notes",
     "support_email",
@@ -2174,13 +2854,5 @@ function openReceipt(url) {
   } else window.open(url, "_blank", "noopener");
 }
 function normalizeDate(raw) {
-  const p = raw.split(/[/-]/);
-  if (p.length !== 3) return daysFromNow(0);
-  let [m, d, y] = p;
-  if (Number(m) > 12) [m, d] = [d, m];
-  if (y.length === 2) y = `20${y}`;
-  const dt = new Date(
-    `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}T12:00:00`,
-  );
-  return Number.isNaN(+dt) ? daysFromNow(0) : dt.toISOString().slice(0, 10);
+  return parseReceiptDate(raw) || daysFromNow(0);
 }
