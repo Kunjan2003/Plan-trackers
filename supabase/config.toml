@@ -1,2 +1,5 @@
 [functions.send-warranty-reminders]
 verify_jwt = false
+
+[functions.share-item]
+verify_jwt = true
