@@ -27,7 +27,6 @@ Reminder rows are created for 30, 7, and 1 day before expiry. Browser notificati
 - OCR is best-effort; always verify the extracted fields before saving.
 - The claim helper prepares the email recipient, subject, and message. Browsers do not let web apps silently attach files to `mailto:` drafts, so it reminds the user to attach the stored receipt.
 - Brand support email is entered by the user when adding an item. No external support-contact directory is configured in the MVP.
-- CSV export and print-to-PDF inventory are available in Settings.
 
 ## Stack
 
