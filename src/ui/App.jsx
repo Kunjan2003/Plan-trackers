@@ -39,9 +39,6 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import JSZip from "jszip";
-import { jsPDF } from "jspdf";
-import autoTable from "jspdf-autotable";
 
 const supabase =
   import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -483,7 +480,11 @@ export default function App() {
       }),
       "warranty-vault.csv",
     );
-  const exportPdf = () => {
+  const exportPdf = async () => {
+    const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+      import("jspdf"),
+      import("jspdf-autotable"),
+    ]);
     const doc = new jsPDF({ orientation: "landscape" });
     doc.setFont("helvetica", "bold");
     doc.setFontSize(20);
@@ -527,6 +528,7 @@ export default function App() {
   };
   const exportBundle = async () => {
     try {
+      const { default: JSZip } = await import("jszip");
       const zip = new JSZip();
       zip.file("warranty-data.csv", itemsToCsv(items, settings.currency));
       const folder = zip.folder("receipts");
